@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# Minimal git worktree helper - leverages git's native capabilities
+# Usage: wt <command> [options]
+#
+# For auto-cd and tab completion, add this to your ~/.bashrc or ~/.zshrc:
+#   source <(wt shellenv)
+#
+# This enables:
+# - Automatic cd to worktree after create/pr/jump commands
+# - Tab completion for commands and branch names
+
+set -e
+
+# Worktree organization: ~/dev/worktrees/<repo>/<branch>
+WORKTREE_ROOT="${WORKTREE_ROOT:-$HOME/dev/worktrees}"
+
+# Show help if no arguments
+show_help() {
+    cat << 'EOF'
+Usage: wt <command> [options]
+
+Git-like worktree management with organized directory structure.
+
+Commands:
+  create <branch> [base]        Create new branch in worktree (default: main/master)
+  pr <number|url>               Checkout GitHub PR in worktree (uses gh)
+  jump, j, cd [branch|query]    Jump to a worktree, create one for an existing branch
+  list, ls                      List all worktrees
+  remove, rm [branch]           Remove a worktree, prompts when omitted
+  prune                         Remove worktree administrative files
+  shellenv                      Output shell function for auto-cd (source this)
+
+Examples:
+  wt jump feature-branch
+  wt create my-feature
+  wt create my-feature develop
+  wt pr 123
+  wt pr https://github.com/org/repo/pull/123
+  wt jump
+  wt jump pr-21442
+  wt list
+  wt remove
+  wt remove old-branch
+  wt prune
+
+Setup auto-cd:
+  Add to ~/.bashrc or ~/.zshrc:
+    source <(wt shellenv)
+
+Worktrees are organized at: $WORKTREE_ROOT/<repo>/<branch>
+Set WORKTREE_ROOT to customize the location (default: ~/dev/worktrees)
+EOF
+}
+
+if [ $# -eq 0 ]; then
+    show_help
+    exit 0
+fi
+
+# Get repo name from git
+get_repo_name() {
+    basename "$(git remote get-url origin 2>/dev/null || git rev-parse --show-toplevel)" .git
+}
+
+# Get default base branch
+get_default_base() {
+    git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo main
+}
+
+get_current_worktree_path() {
+    git rev-parse --path-format=absolute --show-toplevel
+}
+
+branch_is_checked_out() {
+    local branch="$1"
+    git worktree list --porcelain | grep -Fxq "branch refs/heads/$branch"
+}
+
+emit_cd_path() {
+    local path="$1"
+    if [ -n "$WT_CD_FILE" ]; then
+        printf '%s\n' "$path" > "$WT_CD_FILE"
+    else
+        printf 'WT_CD:%s\n' "$path"
+    fi
+}
+
+has_controlling_tty() {
+    [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+create_worktree_for_branch() {
+    local branch="$1"
+    local path="$WORKTREE_ROOT/$repo/$branch"
+
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        if branch_is_checked_out "$branch"; then
+            git worktree add --force "$path" "$branch" >&2
+        else
+            git worktree add "$path" "$branch" >&2
+        fi
+        clone_node_modules "$path"
+        echo "✓ Worktree created at: $path" >&2
+        echo "$path"
+    elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        git worktree add "$path" -b "$branch" --track "origin/$branch" >&2
+        clone_node_modules "$path"
+        echo "✓ Worktree created at: $path" >&2
+        echo "$path"
+    else
+        echo "Error: No worktree or branch matches '$branch'" >&2
+        echo "Use 'wt create $branch' to create a new branch" >&2
+        return 1
+    fi
+}
+
+list_all_worktrees() {
+    local path branch line
+
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                if [ -n "$path" ] && [ -e "$path/.git" ]; then
+                    printf '%s\t%s\n' "${branch:-"(detached)"}" "$path"
+                fi
+                path="${line#worktree }"
+                branch=""
+                ;;
+            "branch refs/heads/"*)
+                branch="${line#branch refs/heads/}"
+                ;;
+            "")
+                if [ -n "$path" ] && [ -e "$path/.git" ]; then
+                    printf '%s\t%s\n' "${branch:-"(detached)"}" "$path"
+                fi
+                path=""
+                branch=""
+                ;;
+        esac
+    done < <(git worktree list --porcelain; printf '\n')
+}
+
+list_removable_worktrees() {
+    local current_worktree branch path
+    current_worktree="$(get_current_worktree_path)"
+
+    while IFS=$'\t' read -r branch path; do
+        if [ -n "$path" ] && [ "$path" != "$current_worktree" ]; then
+            printf '%s\t%s\n' "$branch" "$path"
+        fi
+    done < <(list_all_worktrees)
+}
+
+interactive_cd_worktree() {
+    local paths=() labels=() branch path selection idx
+
+    while IFS=$'\t' read -r branch path; do
+        if [ -n "$path" ]; then
+            paths+=("$path")
+            labels+=("$branch ($path)")
+        fi
+    done < <(list_all_worktrees)
+
+    if [ "${#paths[@]}" -eq 0 ]; then
+        echo "No linked worktrees found." >&2
+        exit 1
+    fi
+
+    echo "Select worktree to cd into:" >&2
+    for idx in "${!paths[@]}"; do
+        printf '  %d) %s\n' "$((idx + 1))" "${labels[$idx]}" >&2
+    done
+
+    printf 'Selection (1-%d, q to cancel): ' "${#paths[@]}" >&2
+    read -r selection </dev/tty
+
+    case "$selection" in
+        q|Q|"")
+            echo "Cancelled." >&2
+            exit 0
+            ;;
+        *[!0-9]*)
+            echo "Error: Invalid selection: $selection" >&2
+            exit 1
+            ;;
+    esac
+
+    idx=$((selection - 1))
+    if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#paths[@]}" ]; then
+        echo "Error: Selection out of range: $selection" >&2
+        exit 1
+    fi
+
+    echo "${paths[$idx]}"
+}
+
+find_worktree_path() {
+    local query="$1"
+    local branch path idx selection
+    local matching_paths=() matching_labels=()
+
+    while IFS=$'\t' read -r branch path; do
+        if [ "$branch" = "$query" ] || [ "$path" = "$query" ] || [ "$(basename "$path")" = "$query" ]; then
+            echo "$path"
+            return 0
+        fi
+
+        if [[ "$branch" == *"$query"* ]] || [[ "$path" == *"$query"* ]]; then
+            matching_paths+=("$path")
+            matching_labels+=("$branch ($path)")
+        fi
+    done < <(list_all_worktrees)
+
+    if [ "${#matching_paths[@]}" -eq 1 ]; then
+        echo "${matching_paths[0]}"
+        return 0
+    fi
+
+    if [ "${#matching_paths[@]}" -gt 1 ]; then
+        if [ ! -t 0 ]; then
+            echo "Error: Multiple worktrees match '$query'" >&2
+            return 1
+        fi
+
+        echo "Multiple worktrees match '$query':" >&2
+        for idx in "${!matching_paths[@]}"; do
+            printf '  %d) %s\n' "$((idx + 1))" "${matching_labels[$idx]}" >&2
+        done
+
+        printf 'Selection (1-%d, q to cancel): ' "${#matching_paths[@]}" >&2
+        read -r selection </dev/tty
+
+        case "$selection" in
+            q|Q|"")
+                echo "Cancelled." >&2
+                return 1
+                ;;
+            *[!0-9]*)
+                echo "Error: Invalid selection: $selection" >&2
+                return 1
+                ;;
+        esac
+
+        idx=$((selection - 1))
+        if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#matching_paths[@]}" ]; then
+            echo "Error: Selection out of range: $selection" >&2
+            return 1
+        fi
+
+        echo "${matching_paths[$idx]}"
+        return 0
+    fi
+
+    return 2
+}
+
+interactive_remove_worktrees() {
+    local paths=() labels=() branch path selection token idx
+    local selected_paths=() selected_labels=() seen=" "
+
+    while IFS=$'\t' read -r branch path; do
+        if [ -n "$path" ]; then
+            paths+=("$path")
+            labels+=("$branch ($path)")
+        fi
+    done < <(list_removable_worktrees)
+
+    if [ "${#paths[@]}" -eq 0 ]; then
+        echo "No removable linked worktrees found." >&2
+        exit 0
+    fi
+
+    echo "Select worktrees to remove:" >&2
+    for idx in "${!paths[@]}"; do
+        printf '  %d) %s\n' "$((idx + 1))" "${labels[$idx]}" >&2
+    done
+
+    printf 'Selection (e.g. 1 3, q to cancel): ' >&2
+    read -r selection </dev/tty
+
+    case "$selection" in
+        q|Q|"")
+            echo "Cancelled." >&2
+            exit 0
+            ;;
+    esac
+
+    selection="${selection//,/ }"
+    for token in $selection; do
+        case "$token" in
+            *[!0-9]*)
+                echo "Error: Invalid selection: $token" >&2
+                exit 1
+                ;;
+        esac
+
+        idx=$((token - 1))
+        if [ "$idx" -lt 0 ] || [ "$idx" -ge "${#paths[@]}" ]; then
+            echo "Error: Selection out of range: $token" >&2
+            exit 1
+        fi
+
+        if [[ "$seen" == *" $idx "* ]]; then
+            continue
+        fi
+
+        seen="$seen$idx "
+        selected_paths+=("${paths[$idx]}")
+        selected_labels+=("${labels[$idx]}")
+    done
+
+    echo "Remove:" >&2
+    for idx in "${!selected_paths[@]}"; do
+        printf '  - %s\n' "${selected_labels[$idx]}" >&2
+    done
+
+    printf 'Continue? [y/N]: ' >&2
+    read -r selection </dev/tty
+
+    case "$selection" in
+        y|Y|yes|YES)
+            ;;
+        *)
+            echo "Cancelled." >&2
+            exit 0
+            ;;
+    esac
+
+    for path in "${selected_paths[@]}"; do
+        git worktree remove "$path"
+        echo "✓ Removed worktree: $path"
+    done
+}
+
+# Clone all non-nested node_modules dirs into a new worktree.
+clone_node_modules() {
+    local dst_root="$1"
+    local src_root
+    src_root="$(git rev-parse --show-toplevel)"
+
+    while IFS= read -r -d '' source; do
+        local relative destination
+        relative="${source#"$src_root"/}"
+        destination="$dst_root/$relative"
+
+        if [ -e "$destination" ]; then
+            continue
+        fi
+
+        mkdir -p "$(dirname "$destination")"
+        cp -cR "$source" "$destination"
+    done < <(find "$src_root" -type d -name node_modules -prune -print0)
+}
+
+# Extract PR number from URL or number
+get_pr_number() {
+    local input="$1"
+    if [[ "$input" =~ ^https://github.com/.*/pull/([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    elif [[ "$input" =~ ^[0-9]+$ ]]; then
+        echo "$input"
+    else
+        echo "Error: Invalid PR number or URL: $input" >&2
+        exit 1
+    fi
+}
+
+repo=$(get_repo_name)
+command="$1"
+shift
+
+case "$command" in
+    shellenv)
+        cat << 'EOF'
+wt() {
+    local tmp_cd exit_code cd_path
+    tmp_cd=$(mktemp "${TMPDIR:-/tmp}/wt.cd.XXXXXX") || return 1
+    WT_CD_FILE="$tmp_cd" command wt "$@"
+    exit_code=$?
+    if [ $exit_code -eq 0 ]; then
+        cd_path=$(cat "$tmp_cd")
+        [ -n "$cd_path" ] && cd "$cd_path"
+    fi
+    rm -f "$tmp_cd"
+    return $exit_code
+}
+
+# Bash completion
+if [ -n "$BASH_VERSION" ]; then
+    _wt_complete() {
+        local cur prev commands
+        COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        commands="create pr jump j cd list ls remove rm prune help shellenv"
+
+        # Complete commands if first argument
+        if [ $COMP_CWORD -eq 1 ]; then
+            COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+            return 0
+        fi
+
+        # Complete branch names for branch-target commands
+        case "$prev" in
+            cd|jump|j|remove|rm)
+                local branches
+                branches=$(git worktree list 2>/dev/null | sed -n 's/.*\[\([^]]*\)\].*/\1/p' | tail -n +2)
+                COMPREPLY=( $(compgen -W "$branches" -- "$cur") )
+                return 0
+                ;;
+        esac
+    }
+    complete -F _wt_complete wt
+fi
+
+# Zsh completion
+if [ -n "$ZSH_VERSION" ]; then
+    _wt_complete_zsh() {
+        local -a commands branches
+        commands=(
+            'create:Create new branch in worktree'
+            'pr:Checkout GitHub PR in worktree'
+            'jump:Jump to a worktree, create one for an existing branch'
+            'j:Jump to a worktree, create one for an existing branch'
+            'cd:Jump to a worktree, create one for an existing branch'
+            'list:List all worktrees'
+            'ls:List all worktrees'
+            'remove:Remove a worktree'
+            'rm:Remove a worktree'
+            'prune:Remove worktree administrative files'
+            'help:Show help'
+            'shellenv:Output shell function for auto-cd'
+        )
+
+        if (( CURRENT == 2 )); then
+            _describe 'command' commands
+        elif (( CURRENT == 3 )); then
+            case "$words[2]" in
+                cd|jump|j|remove|rm)
+                    branches=(${(f)"$(git worktree list 2>/dev/null | sed -n 's/.*\[\([^]]*\)\].*/\1/p' | tail -n +1)"})
+                    _describe 'branch' branches
+                    ;;
+            esac
+        fi
+    }
+    compdef _wt_complete_zsh wt
+fi
+EOF
+        ;;
+
+    create)
+        branch="${1:?Branch name required. Usage: wt create <branch> [base-branch]}"
+        base="${2:-$(get_default_base)}"
+        path="$WORKTREE_ROOT/$repo/$branch"
+
+        # Check if worktree already exists
+        if git worktree list | grep -q "\[$branch\]"; then
+            existing=$(git worktree list | grep "\[$branch\]" | awk '{print $1}')
+            echo "✓ Worktree already exists: $existing"
+            emit_cd_path "$existing"
+            exit 0
+        fi
+
+        if git show-ref --verify --quiet "refs/heads/$branch"; then
+            if branch_is_checked_out "$branch"; then
+                git worktree add --force "$path" "$branch" >&2
+            else
+                git worktree add "$path" "$branch" >&2
+            fi
+        elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            git worktree add "$path" -b "$branch" --track "origin/$branch" >&2
+        else
+            git worktree add "$path" -b "$branch" "$base" >&2
+        fi
+
+        clone_node_modules "$path"
+        echo "✓ Worktree created at: $path"
+
+        emit_cd_path "$path"
+        ;;
+
+    pr)
+        input="${1:?PR number or URL required. Usage: wt pr <number|url>}"
+        pr_number=$(get_pr_number "$input")
+
+        # Check if gh is installed
+        if ! command -v gh >/dev/null 2>&1; then
+            echo "Error: 'gh' CLI not found. Install it from https://cli.github.com" >&2
+            exit 1
+        fi
+
+        # Use gh to checkout PR in a worktree
+        branch=$(gh pr view "$pr_number" --json headRefName --jq '.headRefName')
+        path="$WORKTREE_ROOT/$repo/$branch"
+
+        # Check if worktree already exists
+        if git worktree list | grep -q "\[$branch\]"; then
+            existing=$(git worktree list | grep "\[$branch\]" | awk '{print $1}')
+            echo "✓ Worktree already exists: $existing"
+            emit_cd_path "$existing"
+            exit 0
+        fi
+
+        if git show-ref --verify --quiet "refs/heads/$branch"; then
+            git worktree add "$path" "$branch" >&2
+        elif git fetch origin "$branch" 2>/dev/null; then
+            git worktree add "$path" -b "$branch" --track "origin/$branch" >&2
+        else
+            git fetch origin "pull/$pr_number/head:refs/heads/$branch"
+            git worktree add "$path" "$branch" >&2
+        fi
+
+        clone_node_modules "$path"
+        echo "✓ PR #$pr_number checked out at: $path"
+
+        emit_cd_path "$path"
+        ;;
+
+    cd|jump|j)
+        if [ $# -eq 0 ]; then
+            if ! has_controlling_tty; then
+                echo "Error: Branch/query required when no tty is available" >&2
+                exit 1
+            fi
+            path="$(interactive_cd_worktree)"
+        else
+            if path="$(find_worktree_path "$1")"; then
+                :
+            else
+                status=$?
+                if [ "$status" -eq 2 ]; then
+                    path="$(create_worktree_for_branch "$1")" || exit 1
+                else
+                    exit "$status"
+                fi
+            fi
+        fi
+
+        echo "✓ Switching to worktree: $path"
+        emit_cd_path "$path"
+        ;;
+
+    list|ls)
+        git worktree list
+        ;;
+
+    remove|rm)
+        if [ $# -eq 0 ]; then
+            if ! has_controlling_tty; then
+                echo "Error: Branch name required when no tty is available" >&2
+                exit 1
+            fi
+            interactive_remove_worktrees
+            exit 0
+        fi
+
+        branch="$1"
+        existing=$(git worktree list | grep "\[$branch\]" | awk '{print $1}')
+        if [ -z "$existing" ]; then
+            echo "Error: No worktree found for branch: $branch" >&2
+            exit 1
+        fi
+        git worktree remove "$existing"
+        echo "✓ Removed worktree: $existing"
+        ;;
+
+    prune)
+        git worktree prune
+        echo "✓ Pruned stale worktree administrative files"
+        ;;
+
+    help|--help|-h)
+        show_help
+        ;;
+
+    *)
+        echo "Error: Unknown command '$command'" >&2
+        echo "Run 'wt help' for usage information" >&2
+        exit 1
+        ;;
+esac
