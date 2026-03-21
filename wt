@@ -49,6 +49,7 @@ Setup auto-cd:
 
 Worktrees are organized at: $WORKTREE_ROOT/<repo>/<branch>
 Set WORKTREE_ROOT to customize the location (default: ~/dev/worktrees)
+Set WT_SETUP_HOOK or add .wt-hook at repo root to run setup after creation
 EOF
 }
 
@@ -104,6 +105,65 @@ has_controlling_tty() {
     [ -r /dev/tty ] && [ -w /dev/tty ]
 }
 
+get_setup_hook_path() {
+    local src_root="$1"
+    local hook_path="${WT_SETUP_HOOK:-}"
+
+    if [ -n "$hook_path" ]; then
+        if [[ "$hook_path" != /* ]]; then
+            hook_path="$src_root/$hook_path"
+        fi
+        printf '%s\n' "$hook_path"
+        return 0
+    fi
+
+    hook_path="$src_root/.wt-hook"
+    if [ -f "$hook_path" ]; then
+        printf '%s\n' "$hook_path"
+        return 0
+    fi
+
+    return 1
+}
+
+run_setup_hook() {
+    local dst_root="$1"
+    local branch="$2"
+    local base_branch="${3:-}"
+    local pr_number="${4:-}"
+    local src_root hook_path
+
+    src_root="$(git rev-parse --path-format=absolute --show-toplevel)"
+
+    if ! hook_path="$(get_setup_hook_path "$src_root")"; then
+        return 0
+    fi
+
+    if [ ! -f "$hook_path" ]; then
+        echo "Error: setup hook not found: $hook_path" >&2
+        return 1
+    fi
+
+    if [ ! -r "$hook_path" ]; then
+        echo "Error: setup hook is not readable: $hook_path" >&2
+        return 1
+    fi
+
+    echo "→ Running setup hook: $hook_path" >&2
+
+    (
+        cd "$dst_root"
+        env \
+            WT_SOURCE_PATH="$src_root" \
+            WT_WORKTREE_PATH="$dst_root" \
+            WT_BRANCH="$branch" \
+            WT_BASE_BRANCH="$base_branch" \
+            WT_PR_NUMBER="$pr_number" \
+            WT_REPO="$repo" \
+            bash "$hook_path"
+    )
+}
+
 create_worktree_for_branch() {
     local branch="$1"
     local path="$WORKTREE_ROOT/$repo/$branch"
@@ -114,12 +174,12 @@ create_worktree_for_branch() {
         else
             git worktree add "$path" "$branch" >&2
         fi
-        clone_node_modules "$path"
+        run_setup_hook "$path" "$branch"
         echo "✓ Worktree created at: $path" >&2
         echo "$path"
     elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
         git worktree add "$path" -b "$branch" --track "origin/$branch" >&2
-        clone_node_modules "$path"
+        run_setup_hook "$path" "$branch"
         echo "✓ Worktree created at: $path" >&2
         echo "$path"
     else
@@ -347,26 +407,6 @@ interactive_remove_worktrees() {
     done
 }
 
-# Clone all non-nested node_modules dirs into a new worktree.
-clone_node_modules() {
-    local dst_root="$1"
-    local src_root
-    src_root="$(git rev-parse --show-toplevel)"
-
-    while IFS= read -r -d '' source; do
-        local relative destination
-        relative="${source#"$src_root"/}"
-        destination="$dst_root/$relative"
-
-        if [ -e "$destination" ]; then
-            continue
-        fi
-
-        mkdir -p "$(dirname "$destination")"
-        cp -cR "$source" "$destination"
-    done < <(find "$src_root" -type d -name node_modules -prune -print0)
-}
-
 # Extract PR number from URL or number
 get_pr_number() {
     local input="$1"
@@ -490,7 +530,7 @@ EOF
             git worktree add "$path" -b "$branch" "$base" >&2
         fi
 
-        clone_node_modules "$path"
+        run_setup_hook "$path" "$branch" "$base"
         echo "✓ Worktree created at: $path"
 
         emit_cd_path "$path"
@@ -527,7 +567,7 @@ EOF
             git worktree add "$path" "$branch" >&2
         fi
 
-        clone_node_modules "$path"
+        run_setup_hook "$path" "$branch" "" "$pr_number"
         echo "✓ PR #$pr_number checked out at: $path"
 
         emit_cd_path "$path"
