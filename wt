@@ -3,7 +3,7 @@
 # Usage: wt <command> [options]
 #
 # For auto-cd and tab completion, add this to your ~/.bashrc or ~/.zshrc:
-#   source <(wt shellenv)
+#   eval "$(wt shellenv)"
 #
 # This enables:
 # - Automatic cd to worktree after create/pr/jump commands
@@ -28,7 +28,7 @@ Commands:
   list, ls                      List all worktrees
   remove, rm [branch]           Remove a worktree, prompts when omitted
   prune                         Remove worktree administrative files
-  shellenv                      Output shell function for auto-cd (source this)
+  shellenv                      Output shell function for auto-cd (eval this)
 
 Examples:
   wt jump feature-branch
@@ -45,7 +45,7 @@ Examples:
 
 Setup auto-cd:
   Add to ~/.bashrc or ~/.zshrc:
-    source <(wt shellenv)
+    eval "$(wt shellenv)"
 
 Worktrees are organized at: $WORKTREE_ROOT/<repo>/<branch>
 Set WORKTREE_ROOT to customize the location (default: ~/dev/worktrees)
@@ -64,7 +64,21 @@ get_repo_name() {
 
 # Get default base branch
 get_default_base() {
-    git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo main
+    local base
+    base="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    base="${base#origin/}"
+
+    if [ -n "$base" ]; then
+        printf '%s\n' "$base"
+    elif git show-ref --verify --quiet refs/heads/main; then
+        printf 'main\n'
+    elif git show-ref --verify --quiet refs/heads/master; then
+        printf 'master\n'
+    else
+        echo "Error: could not determine a default base branch" >&2
+        echo "Pass one explicitly: wt create <branch> <base>" >&2
+        return 1
+    fi
 }
 
 get_current_worktree_path() {
@@ -82,6 +96,7 @@ emit_cd_path() {
         printf '%s\n' "$path" > "$WT_CD_FILE"
     else
         printf 'WT_CD:%s\n' "$path"
+        printf 'Tip: load shell integration with: eval "$(wt shellenv)"\n' >&2
     fi
 }
 
@@ -372,10 +387,12 @@ shift
 case "$command" in
     shellenv)
         cat << 'EOF'
+_WT_BIN=$(command -v wt)
+
 wt() {
     local tmp_cd exit_code cd_path
     tmp_cd=$(mktemp "${TMPDIR:-/tmp}/wt.cd.XXXXXX") || return 1
-    WT_CD_FILE="$tmp_cd" command wt "$@"
+    env WT_CD_FILE="$tmp_cd" "$_WT_BIN" "$@"
     exit_code=$?
     if [ $exit_code -eq 0 ]; then
         cd_path=$(cat "$tmp_cd")
@@ -414,7 +431,7 @@ if [ -n "$BASH_VERSION" ]; then
 fi
 
 # Zsh completion
-if [ -n "$ZSH_VERSION" ]; then
+if [ -n "$ZSH_VERSION" ] && command -v compdef >/dev/null 2>&1; then
     _wt_complete_zsh() {
         local -a commands branches
         commands=(
