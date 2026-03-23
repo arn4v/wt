@@ -25,6 +25,7 @@ Commands:
   create <branch> [base]        Create new branch in worktree (default: main/master)
   pr <number|url>               Checkout GitHub PR in worktree (uses gh)
   jump, j, cd [branch|query]    Jump to a worktree, create one for an existing branch
+  main                         Jump to the main worktree
   list, ls                      List all worktrees
   remove, rm [branch]           Remove a worktree, prompts when omitted
   prune                         Remove worktree administrative files
@@ -38,6 +39,7 @@ Examples:
   wt pr https://github.com/org/repo/pull/123
   wt jump
   wt jump pr-21442
+  wt main
   wt list
   wt remove
   wt remove old-branch
@@ -84,6 +86,10 @@ get_default_base() {
 
 get_current_worktree_path() {
     git rev-parse --path-format=absolute --show-toplevel
+}
+
+get_main_worktree_path() {
+    git worktree list --porcelain | sed -n 's/^worktree //p' | sed -n '1p'
 }
 
 branch_is_checked_out() {
@@ -449,7 +455,7 @@ if [ -n "$BASH_VERSION" ]; then
         COMPREPLY=()
         cur="${COMP_WORDS[COMP_CWORD]}"
         prev="${COMP_WORDS[COMP_CWORD-1]}"
-        commands="create pr jump j cd list ls remove rm prune help shellenv"
+        commands="create pr jump j cd main list ls remove rm prune help shellenv"
 
         # Complete commands if first argument
         if [ $COMP_CWORD -eq 1 ]; then
@@ -480,6 +486,7 @@ if [ -n "$ZSH_VERSION" ] && command -v compdef >/dev/null 2>&1; then
             'jump:Jump to a worktree, create one for an existing branch'
             'j:Jump to a worktree, create one for an existing branch'
             'cd:Jump to a worktree, create one for an existing branch'
+            'main:Jump to the main worktree'
             'list:List all worktrees'
             'ls:List all worktrees'
             'remove:Remove a worktree'
@@ -594,6 +601,17 @@ EOF
         fi
 
         echo "✓ Switching to worktree: $path"
+        emit_cd_path "$path"
+        ;;
+
+    main)
+        path="$(get_main_worktree_path)"
+        if [ -z "$path" ]; then
+            echo "Error: Could not determine main worktree path" >&2
+            exit 1
+        fi
+
+        echo "✓ Switching to main worktree: $path"
         emit_cd_path "$path"
         ;;
 

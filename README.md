@@ -41,6 +41,7 @@ Install https://github.com/arn4v/wt for me. Clone it if needed, symlink the repo
 wt create <branch> [base]
 wt pr <number|url>
 wt jump|j|cd [branch|query]
+wt main
 wt list|ls
 wt remove|rm [branch]
 wt prune
