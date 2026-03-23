@@ -19,7 +19,7 @@ show_help() {
     cat << 'EOF'
 Usage: wt <command> [options]
 
-Git-like worktree management with organized directory structure.
+Minimal git worktree helper.
 
 Commands:
   create <branch> [base]        Create new branch in worktree (default: main/master)
