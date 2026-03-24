@@ -43,7 +43,7 @@ wt pr <number|url>
 wt jump|j|cd [branch|query]
 wt main
 wt list|ls
-wt remove|rm [branch]
+wt remove|rm [branch|path|query]
 wt prune
 wt shellenv
 ```
@@ -53,6 +53,8 @@ wt shellenv
 - `eval "$(wt shellenv)"` is required for auto-`cd`
 - Do not use `source <(wt shellenv)` in bash
 - `wt create` uses `origin/HEAD`, then `main`, then `master`
+- `wt remove` accepts a branch, worktree basename, or full path
+- `wt remove` excludes the main checkout from interactive removal
 
 ## Hooks
 
