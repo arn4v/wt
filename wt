@@ -23,6 +23,7 @@ Minimal git worktree helper.
 
 Commands:
   create <branch> [base]        Create new branch in worktree (default: main/master)
+  linear <url>                  Create worktree from a Linear issue URL
   pr <number|url>               Checkout GitHub PR in worktree (uses gh)
   jump, j, cd [branch|query]    Jump to a worktree, create one for an existing branch
   main                         Jump to the main worktree
@@ -35,6 +36,7 @@ Examples:
   wt jump feature-branch
   wt create my-feature
   wt create my-feature develop
+  wt linear https://linear.app/org/issue/ENG-44302/some-issue-title
   wt pr 123
   wt pr https://github.com/org/repo/pull/123
   wt jump
@@ -546,6 +548,103 @@ get_pr_number() {
     fi
 }
 
+get_worktree_path_for_branch() {
+    local branch="$1"
+    local path line current_path
+
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*)
+                current_path="${line#worktree }"
+                ;;
+            "")
+                current_path=""
+                ;;
+        esac
+
+        if [ "$line" = "branch refs/heads/$branch" ]; then
+            printf '%s\n' "$current_path"
+            return 0
+        fi
+    done < <(git worktree list --porcelain; printf '\n')
+
+    return 1
+}
+
+normalize_branch_slug() {
+    printf '%s\n' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+trim_truncated_linear_slug() {
+    local slug="$1"
+    local trimmed
+
+    if [ "${#slug}" -ne 63 ] || [[ "$slug" != *-* ]]; then
+        printf '%s\n' "$slug"
+        return 0
+    fi
+
+    trimmed="${slug%-*}"
+    printf '%s\n' "${trimmed:-$slug}"
+}
+
+get_linear_branch_name() {
+    local input="$1"
+    local issue_id raw_slug slug
+
+    if [[ "$input" =~ linear\.app/[^/]+/issue/([A-Za-z]+-[0-9]+)/([^/?#]+) ]]; then
+        issue_id="${BASH_REMATCH[1]}"
+        raw_slug="${BASH_REMATCH[2]}"
+    elif [[ "$input" =~ ([A-Za-z]+-[0-9]+)/([^/?#]+) ]]; then
+        issue_id="${BASH_REMATCH[1]}"
+        raw_slug="${BASH_REMATCH[2]}"
+    else
+        echo "Error: Invalid Linear issue URL: $input" >&2
+        exit 1
+    fi
+
+    issue_id="$(printf '%s\n' "$issue_id" | tr '[:upper:]' '[:lower:]')"
+    slug="$(normalize_branch_slug "$raw_slug")"
+    slug="$(trim_truncated_linear_slug "$slug")"
+
+    if [ -z "$slug" ]; then
+        echo "Error: Could not extract Linear issue slug from: $input" >&2
+        exit 1
+    fi
+
+    printf '%s-%s\n' "$issue_id" "$slug"
+}
+
+create_or_open_worktree() {
+    local branch="$1"
+    local base="${2:-$(get_default_base)}"
+    local path existing
+
+    path="$WORKTREE_ROOT/$repo/$branch"
+
+    if existing="$(get_worktree_path_for_branch "$branch")"; then
+        WT_RESULT_PATH="$existing"
+        stdout_line "$WT_GREEN" "✓ Worktree already exists: $existing"
+        return 0
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+        if branch_is_checked_out "$branch"; then
+            git worktree add --force "$path" "$branch" >&2
+        else
+            git worktree add "$path" "$branch" >&2
+        fi
+    elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+        git worktree add "$path" -b "$branch" --track "origin/$branch" >&2
+    else
+        git worktree add "$path" -b "$branch" "$base" >&2
+    fi
+
+    run_setup_hook "$path" "$branch" "$base"
+    WT_RESULT_PATH="$path"
+    stdout_line "$WT_GREEN" "✓ Worktree created at: $path"
+}
+
 repo=$(get_repo_name)
 command="$1"
 shift
@@ -599,7 +698,7 @@ if [ -n "$BASH_VERSION" ]; then
         COMPREPLY=()
         cur="${COMP_WORDS[COMP_CWORD]}"
         prev="${COMP_WORDS[COMP_CWORD-1]}"
-        commands="create pr jump j cd main list ls remove rm prune help shellenv"
+        commands="create linear pr jump j cd main list ls remove rm prune help shellenv"
 
         # Complete commands if first argument
         if [ $COMP_CWORD -eq 1 ]; then
@@ -636,6 +735,7 @@ if [ -n "$ZSH_VERSION" ] && command -v compdef >/dev/null 2>&1; then
         local -a commands branches worktrees
         commands=(
             'create:Create new branch in worktree'
+            'linear:Create worktree from a Linear issue URL'
             'pr:Checkout GitHub PR in worktree'
             'jump:Jump to a worktree, create one for an existing branch'
             'j:Jump to a worktree, create one for an existing branch'
@@ -677,32 +777,15 @@ EOF
     create)
         branch="${1:?Branch name required. Usage: wt create <branch> [base-branch]}"
         base="${2:-$(get_default_base)}"
-        path="$WORKTREE_ROOT/$repo/$branch"
+        create_or_open_worktree "$branch" "$base"
+        emit_cd_path "$WT_RESULT_PATH"
+        ;;
 
-        # Check if worktree already exists
-        if git worktree list | grep -q "\[$branch\]"; then
-            existing=$(git worktree list | grep "\[$branch\]" | awk '{print $1}')
-            echo "✓ Worktree already exists: $existing"
-            emit_cd_path "$existing"
-            exit 0
-        fi
-
-        if git show-ref --verify --quiet "refs/heads/$branch"; then
-            if branch_is_checked_out "$branch"; then
-                git worktree add --force "$path" "$branch" >&2
-            else
-                git worktree add "$path" "$branch" >&2
-            fi
-        elif git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
-            git worktree add "$path" -b "$branch" --track "origin/$branch" >&2
-        else
-            git worktree add "$path" -b "$branch" "$base" >&2
-        fi
-
-        run_setup_hook "$path" "$branch" "$base"
-        stdout_line "$WT_GREEN" "✓ Worktree created at: $path"
-
-        emit_cd_path "$path"
+    linear)
+        input="${1:?Linear issue URL required. Usage: wt linear <url>}"
+        branch="$(get_linear_branch_name "$input")"
+        create_or_open_worktree "$branch"
+        emit_cd_path "$WT_RESULT_PATH"
         ;;
 
     pr)

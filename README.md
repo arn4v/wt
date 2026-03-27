@@ -39,6 +39,7 @@ Install https://github.com/arn4v/wt for me. Clone it if needed, symlink the repo
 
 ```bash
 wt create <branch> [base]
+wt linear <url>
 wt pr <number|url>
 wt jump|j|cd [branch|query]
 wt main
@@ -53,6 +54,7 @@ wt shellenv
 - `eval "$(wt shellenv)"` is required for auto-`cd`
 - Do not use `source <(wt shellenv)` in bash
 - `wt create` uses `origin/HEAD`, then `main`, then `master`
+- `wt linear` turns a Linear issue URL into `<issue-id>-<slug>` and creates that worktree
 - `wt remove` accepts a branch, worktree basename, or full path
 - `wt remove` excludes the main checkout from interactive removal
 
