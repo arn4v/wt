@@ -53,6 +53,8 @@ wt shellenv
 
 - `eval "$(wt shellenv)"` is required for auto-`cd`
 - Do not use `source <(wt shellenv)` in bash
+- Set `git config wt.defaultBase <branch>` to override the default base branch per repo or globally
+- `WT_DEFAULT_BASE` overrides `wt.defaultBase` for the current shell
 - `wt create` uses `origin/HEAD`, then `main`, then `master`
 - `wt linear` turns a Linear issue URL into `<issue-id>-<slug>` and creates that worktree
 - `wt remove` accepts a branch, worktree basename, or full path

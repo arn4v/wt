@@ -54,6 +54,7 @@ Setup auto-cd:
 
 Worktrees are organized at: $WORKTREE_ROOT/<repo>/<branch>
 Set WORKTREE_ROOT to customize the location (default: ~/dev/worktrees)
+Set WT_DEFAULT_BASE or git config wt.defaultBase to override the default base branch
 Set WT_SETUP_HOOK or add .wt-hook at repo root to run setup after creation
 EOF
 }
@@ -71,6 +72,18 @@ get_repo_name() {
 # Get default base branch
 get_default_base() {
     local base
+
+    if [ -n "${WT_DEFAULT_BASE:-}" ]; then
+        printf '%s\n' "$WT_DEFAULT_BASE"
+        return 0
+    fi
+
+    base="$(git config --get wt.defaultBase 2>/dev/null || true)"
+    if [ -n "$base" ]; then
+        printf '%s\n' "$base"
+        return 0
+    fi
+
     base="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
     base="${base#origin/}"
 
